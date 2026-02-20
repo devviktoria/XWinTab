@@ -47,7 +47,6 @@ typedef struct ContextTAG {
     LOGCONTEXTW logContext;
 } Context;
 
-
 static BOOL g_didInit;
 static Context g_context;
 static DeviceInfo g_deviceInfo;
@@ -62,6 +61,32 @@ static DeviceInfo* (WINAPI *pGetSelectedDevice)();
 static int (WINAPI *pBeginEvents)(EventCallback callback);
 static int (WINAPI *pCheckEvents)(int timeout);
 static int (WINAPI *pShutdown)(void);
+
+/* ----------------------------------------------------------
+ * ANSI (A) implementation of the Wintab context.
+ *
+ * This structure mirrors the Unicode (W) version but stores
+ * a LOGCONTEXTA and is used when the caller invokes the
+ * WT* A-functions (e.g. WTOpenA).
+ *
+ * Some applications still rely on the ANSI API, therefore
+ * both A and W paths must be supported.
+ * ---------------------------------------------------------- */
+typedef struct ContextTAGA {
+    PacketQueue queue;
+    HWND hwnd;
+    HCTX handle;
+    BOOL enabled;
+    BOOL inProximity;
+    LOGCONTEXTA logContext;
+} ContextA;
+
+// Simple fixed-size context storage for ANSI callers
+#define MAX_CONTEXTS 4
+static ContextA g_contexts[MAX_CONTEXTS];
+static UINT g_contextCount = 0;
+static UINT_PTR g_nextContextHandle = 0x80;
+//----------------------------------------------------------
 
 #define XWT_PACKET        0
 #define XWT_CTXOPEN       1
@@ -84,6 +109,44 @@ static FILE *g_logFile;
 // ----------------
 // Logging
 //
+static void log_str(const char *str) {
+    if (!g_logFile)
+        return;
+    fprintf(g_logFile, "%s", str);
+}
+
+static void log_strf(const char *fmt, ...) {
+    if (!g_logFile)
+        return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_logFile, fmt, args);
+    va_end(args);
+}
+
+static void log_hwnd_info(const char* tag, HWND hwnd)
+{
+    DWORD wndThread = 0;
+    DWORD wndPid = 0;
+
+    if (hwnd)
+        wndThread = GetWindowThreadProcessId(hwnd, &wndPid);
+
+    log_strf("%s: hwnd=%p IsWindow=%d wndThread=%lu wndPid=%lu curThread=%lu\n",
+             tag,
+             hwnd,
+             IsWindow(hwnd),
+             wndThread,
+             wndPid,
+             GetCurrentThreadId());
+}
+
+static void close_log() {
+    if (!g_logFile)
+        return;
+    fclose(g_logFile);
+    g_logFile = NULL;
+}
 
 void err_dlg(const WCHAR *msg) {
     MessageBoxW(NULL, msg, L"XWinTab Error", MB_OK);
@@ -119,29 +182,6 @@ static void init_log() {
     if (!g_logFile)
         err_dlg(L"Error opening log file: _wfopen() failed.");
 }
-
-static void log_str(const char *str) {
-    if (!g_logFile)
-        return;
-    fprintf(g_logFile, "%s", str);
-}
-
-static void log_strf(const char *fmt, ...) {
-    if (!g_logFile)
-        return;
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(g_logFile, fmt, args);
-    va_end(args);
-}
-
-static void close_log() {
-    if (!g_logFile)
-        return;
-    fclose(g_logFile);
-    g_logFile = NULL;
-}
-
 
 // ----------------
 // Packet Queue
@@ -265,8 +305,11 @@ static BOOL context_message(Context *ctx, UINT msg, WPARAM wParam,
     BOOL result;
     result = PostMessageW(ctx->hwnd, msg + ctx->logContext.lcMsgBase,
                           wParam, lParam);
-    if (!result)
-        log_strf("context_message send fail\n");
+    if (!result) {
+        DWORD err = GetLastError();
+        log_strf("context_message send fail, err=%lu hwnd=%p msg=%u base=%u\n",
+                    err, ctx->hwnd, msg, ctx->logContext.lcMsgBase);
+    }
     return result;
 }
 
@@ -282,13 +325,17 @@ static UINT copy_field(void *dst, const void *src, size_t size) {
     return size32;
 }
 
-static UINT packet_copy(Context *ctx, const PacketData *packet, void *out) {
+static UINT packet_copy(WTPKT lcPktData,
+                        HCTX  handle,
+                        const PacketData *packet,
+                        void *out)
+{
     UINT written = 0;
-    char *pkt = (char *) out;
-    WTPKT mask = ctx->logContext.lcPktData;
+    char *pkt = (char *)out;
+    WTPKT mask = lcPktData;
 
     if (mask & PK_CONTEXT)
-        written += copy_field(&pkt[written], &ctx->handle, sizeof(HCTX));
+        written += copy_field(&pkt[written], &handle, sizeof(HCTX));
     if (mask & PK_STATUS)
         written += copy_field(&pkt[written], &packet->pkStatus, sizeof(UINT));
     if (mask & PK_TIME)
@@ -329,7 +376,7 @@ static UINT packet_copy(Context *ctx, const PacketData *packet, void *out) {
         data.roPitch = data.roRoll = data.roYaw = 0;
         written += copy_field(&pkt[written], &data, sizeof(ROTATION));
     }
-    log_strf("packet: x %d y %d p %d serial %d\n",
+    log_strf("packet_copy: x %d y %d p %d serial %d\n",
             packet->pkX, packet->pkY, packet->pkNormalPressure, packet->pkSerialNumber);
     return written;
 }
@@ -420,7 +467,7 @@ static void WINAPI on_event(EventInfo *ev) {
     // Can't be bothered computing this properly right now.
     pkt->pkChanged = g_context.logContext.lcPktData;
 
-    log_strf("event: x %d y %d p %d tltx %d tlty %d serial %d\n",
+    log_strf("on_event: x %d y %d p %d tltx %d tlty %d serial %d\n",
             ev->x, ev->y, ev->pressure, ev->xTilt, ev->yTilt, pkt->pkSerialNumber);
 
     if (ev->type == kEventTypeProximityIn ||
@@ -631,133 +678,148 @@ BOOL WINAPI WTClose(HCTX ctx) {
     return TRUE;
 }
 
-UINT WINAPI WTInfoW(UINT cat, UINT idx, LPVOID ptr) {
-    if (!g_didInit)
-        load_xwintab();
+static UINT TabletInfoCommon(UINT cat, UINT idx, LPVOID ptr)
+{
+    if (cat == WTI_DEVICES) {
+        LPAXIS out;
 
-    if ((cat == WTI_DEFCONTEXT || cat == WTI_DEFSYSCTX) && !idx) {
-        log_strf("WTInfoW: Request for default logcontext\n");
-        if (ptr)
-            init_log_context((LPLOGCONTEXTW) ptr);
-        return sizeof(LOGCONTEXTW);
-    }
+        switch (idx) {
 
-    if (cat == WTI_DEVICES && idx == DVC_ORIENTATION) {
-        if (ptr) {
-            LPAXIS out = (LPAXIS) ptr;
-            out[0].axMin = 0;
-            out[0].axMax = 3600;
-            out[0].axUnits = TU_CIRCLE;
-            out[0].axResolution = CASTFIX32(3600);
-
-            out[1].axMin = -900;//-1000;
-            out[1].axMax = 900;//1000;
-            out[1].axUnits = TU_CIRCLE;
-            out[1].axResolution = CASTFIX32(3600);
-
-            out[2].axMin = 0;
-            out[2].axMax = 3600;
-            out[2].axUnits = TU_CIRCLE;
-            out[2].axResolution = CASTFIX32(3600);
-        }
-        return sizeof(AXIS) * 3;
-    }
-
-    if (cat == WTI_DEVICES && idx == DVC_NPRESSURE) {
-        if (ptr) {
-            LPAXIS out = (LPAXIS) ptr;
-            if (g_deviceInfo.id != -1) {
-                out->axMin = g_deviceInfo.pressureAxis.min;
-                out->axMax = g_deviceInfo.pressureAxis.max;
-                out->axResolution = g_deviceInfo.pressureAxis.resolution;
-            } else {
-                out->axMin = 0;
-                out->axMax = 1024;
-                out->axResolution = 1;
+        case DVC_X:
+            if (ptr) {
+                out = (LPAXIS)ptr;
+                out->axMin = g_deviceInfo.id != -1 ? g_deviceInfo.xAxis.min : 0;
+                out->axMax = g_deviceInfo.id != -1 ? g_deviceInfo.xAxis.max : 1024;
+                out->axResolution = g_deviceInfo.id != -1 ? g_deviceInfo.xAxis.resolution : 1;
+                out->axUnits = TU_INCHES;
             }
-            out->axUnits = TU_INCHES;
-        }
-        return sizeof(AXIS);
-    }
+            return sizeof(AXIS);
 
-    if (cat == WTI_DEVICES && idx == DVC_TPRESSURE) {
-        if (ptr) {
-            // Unsupported
-            LPAXIS out = (LPAXIS) ptr;
-            out->axMin = 0;
-            out->axMax = 0;
-            out->axResolution = 0;
-            out->axUnits = TU_INCHES;
+        case DVC_Y:
+            if (ptr) {
+                out = (LPAXIS)ptr;
+                out->axMin = g_deviceInfo.id != -1 ? g_deviceInfo.yAxis.min : 0;
+                out->axMax = g_deviceInfo.id != -1 ? g_deviceInfo.yAxis.max : 1024;
+                out->axResolution = g_deviceInfo.id != -1 ? g_deviceInfo.yAxis.resolution : 1;
+                out->axUnits = TU_INCHES;
+            }
+            return sizeof(AXIS);
+
+        case DVC_NPRESSURE:
+            if (ptr) {
+                out = (LPAXIS)ptr;
+                if (g_deviceInfo.id != -1) {
+                    out->axMin = g_deviceInfo.pressureAxis.min;
+                    out->axMax = g_deviceInfo.pressureAxis.max;
+                    out->axResolution = g_deviceInfo.pressureAxis.resolution;
+                } else {
+                    out->axMin = 0;
+                    out->axMax = 1024;
+                    out->axResolution = 1;
+                }
+                out->axUnits = TU_INCHES;
+            }
+            return sizeof(AXIS);
+
+        case DVC_TPRESSURE:
+            if (ptr) {
+                out = (LPAXIS)ptr;
+                out->axMin = 0;
+                out->axMax = 0;
+                out->axResolution = 0;
+                out->axUnits = TU_INCHES;
+            }
+            return sizeof(AXIS);
+
+        case DVC_ORIENTATION:
+            if (ptr) {
+                out = (LPAXIS)ptr;
+
+                out[0].axMin = 0;
+                out[0].axMax = 3600;
+                out[0].axResolution = CASTFIX32(3600);
+                out[0].axUnits = TU_CIRCLE;
+
+                out[1].axMin = -900;
+                out[1].axMax = 900;
+                out[1].axResolution = CASTFIX32(3600);
+                out[1].axUnits = TU_CIRCLE;
+
+                out[2].axMin = 0;
+                out[2].axMax = 3600;
+                out[2].axResolution = CASTFIX32(3600);
+                out[2].axUnits = TU_CIRCLE;
+            }
+            return sizeof(AXIS) * 3;
         }
-        return sizeof(AXIS);
     }
 
     if (cat == (WTI_CURSORS + 1) && idx == CSR_PHYSID) {
-        if (ptr) {
-            LPDWORD out = (LPDWORD) ptr;
-            *out = 0;
-        }
+        if (ptr)
+            *(LPDWORD)ptr = 0;
         return sizeof(DWORD);
     }
 
     if (cat == (WTI_CURSORS + 1) && idx == CSR_TYPE) {
-        if (ptr) {
-            LPUINT out = (LPUINT) ptr;
-            *out = 0x822;
-        }
+        if (ptr)
+            *(LPUINT)ptr = 0x822;
         return sizeof(UINT);
     }
 
     if (cat == (WTI_CURSORS + 1) && idx == CSR_SYSBTNMAP) {
         if (ptr) {
-            memset(ptr, 0, sizeof(BYTE)*32);
-            LPBYTE out = (LPBYTE) ptr;
+            memset(ptr, 0, sizeof(BYTE) * 32);
+            LPBYTE out = (LPBYTE)ptr;
             for (int i = 0; i < 8; i++)
                 out[i] = 1 << i;
         }
         return sizeof(BYTE) * 32;
     }
 
-    if (cat == WTI_INTERFACE) {
-        if (idx == IFC_WINTABID) {
-            if (ptr) {
-                wchar_t *out = (wchar_t *) ptr;
-                for (size_t i = 0; i < sizeof(kXWinTabID); i++)
-                    out[i] = kXWinTabID[i];
-            }
-            return sizeof(kXWinTabID) * sizeof(wchar_t);
+    if (cat == WTI_INTERFACE && idx == IFC_IMPLVERSION) {
+        if (ptr) {
+            WORD *out = (WORD *)ptr;
+            *out = (XWINTAB_VERSION_MAJOR << 8) | XWINTAB_VERSION_MINOR;
         }
-
-        if (idx == IFC_IMPLVERSION) {
-            if (ptr) {
-                WORD *out = (WORD *) ptr;
-                *out = (XWINTAB_VERSION_MAJOR << 8) | XWINTAB_VERSION_MINOR;
-            }
-            return sizeof(WORD);
-        }
+        return sizeof(WORD);
     }
 
-    log_strf("WTInfow: unhandled cat %d idx %d\n", cat, idx);
+    if (cat == WTI_STATUS && idx == STA_PKTRATE) {
+        if (ptr)
+            *(UINT*)ptr = 100;
+        return sizeof(UINT);
+    }
+
     return 0;
 }
 
-BOOL WINAPI WTEnable(HCTX ctx, BOOL enable) {
-    if (!ctx || g_context.handle != ctx)
-        return FALSE;
-    // We won't be getting any events anyway
-    if (g_deviceInfo.id == -1)
-        return TRUE;
+UINT WINAPI WTInfoW(UINT cat, UINT idx, LPVOID ptr)
+{
+    if (!g_didInit)
+        load_xwintab();
 
-    EnterCriticalSection(&g_lock);
-    g_context.enabled = enable;
-    log_strf("WTEnable: %d\n", enable);
-    LeaveCriticalSection(&g_lock);
+    if ((cat == WTI_DEFCONTEXT || cat == WTI_DEFSYSCTX) && !idx) {
+        log_strf("WTInfoW: Request for default logcontext\n");
+        if (ptr)
+            init_log_context((LPLOGCONTEXTW)ptr);
+        return sizeof(LOGCONTEXTW);
+    }
 
-    g_context.logContext.lcStatus = enable ? CXS_ONTOP : CXS_DISABLED;
+    if (cat == WTI_INTERFACE && idx == IFC_WINTABID) {
+        if (ptr) {
+            wchar_t *out = (wchar_t *)ptr;
+            for (size_t i = 0; i < sizeof(kXWinTabID); i++)
+                out[i] = kXWinTabID[i];
+        }
+        return sizeof(kXWinTabID) * sizeof(wchar_t);
+    }
 
-    context_message(&g_context, XWT_CTXOVERLAP, (WPARAM) g_context.handle,
-                    g_context.logContext.lcStatus);
-    return TRUE;
+    UINT res = TabletInfoCommon(cat, idx, ptr);
+    if (res)
+        return res;
+
+    log_strf("WTInfoW: unhandled cat %d idx %d\n", cat, idx);
+    return 0;
 }
 
 BOOL WINAPI WTOverlap(HCTX ctx, BOOL top) {
@@ -781,7 +843,10 @@ int WINAPI WTPacketsGet(HCTX ctx, int count, LPVOID ptr) {
             break;
         log_strf("WTPacketsGet read a packet\n", read);
         if (out)
-            out += packet_copy(&g_context, pkt, out);
+            out += packet_copy(g_context.logContext.lcPktData,
+                                g_context.handle,
+                                pkt,
+                                out);//packet_copy(&g_context, pkt, out);
         read++;
     }
     log_strf("WTPacketsGet Read: %d Packets\n", read);
@@ -797,7 +862,10 @@ typedef struct PktPeekIterData {
 
 static BOOL pkt_peek_itr(PacketData *pkt, void *userData) {
     PktPeekIterData *data = (PktPeekIterData *) data;
-    data->dst += packet_copy(&g_context, pkt, data->dst);
+    data->dst += packet_copy(g_context.logContext.lcPktData,
+                                g_context.handle,
+                                pkt,
+                                data->dst);//packet_copy(&g_context, pkt, data->dst);
     data->read++;
     return data->read < data->count;
 }
@@ -858,3 +926,481 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  reason, LPVOID lpReserved) {
     }
     return FALSE;
 }
+
+/*------------------------------------------------------------------------------------------------------------
+* WTInfoA, WTOpenA, WTGetA, WTSetA, WTPacket
+* implementation for Expresii
+*/
+
+static HCTX alloc_context_handle(void)
+{
+    return (HCTX)g_nextContextHandle++;
+}
+
+/* --------------------------------------------------------------------
+ * Post a Wintab context message to the target window (ANSI context).
+ *
+ * The final message ID is:
+ *     msg + lcMsgBase
+ *
+ * Debug logging is intentionally commented because the extra overhead
+ * breaks high-rate pressure packet delivery.
+ * Uncomment it only for short diagnostic sessions.
+ * -------------------------------------------------------------------- */
+static BOOL context_messageA(ContextA *ctx, UINT msg, WPARAM wParam, LPARAM lParam) {
+    /*
+    *log_hwnd_info("context_messageA", ctx->hwnd);
+    *
+    *log_strf("context_messageA msg=%u realMsg=%u base=%u wParam=%p lParam=%p\n",
+             msg,
+             msg + ctx->logContext.lcMsgBase,
+             ctx->logContext.lcMsgBase,
+             (void*)wParam,
+             (void*)lParam);*/
+
+    BOOL result = PostMessage(ctx->hwnd, msg + ctx->logContext.lcMsgBase, wParam, lParam);
+    if (!result) {
+        DWORD err = GetLastError();
+        log_strf("context_messageA send fail, err=%lu hwnd=%p msg=%u base=%u\n",
+                  err, ctx->hwnd, msg, ctx->logContext.lcMsgBase);
+    }
+    return result;
+}
+
+/* --------------------------------------------------------------------
+ * Returns the first active ANSI context from the global context array.
+ *
+ * A context is considered active if:
+ *   - it has a valid handle
+ *   - it is enabled
+ *   - its target window is still valid
+ *
+ * The search is linear and stops at the first match.
+ * Returns NULL if no usable context is found.
+ * -------------------------------------------------------------------- */
+static ContextA* get_active_ctx(void)
+{
+    for (int i = 0; i < MAX_CONTEXTS; ++i) {
+        ContextA *ctx = &g_contexts[i];
+
+        if (!ctx->handle)
+            continue;
+
+        if (!ctx->enabled)
+            continue;
+
+        if (!IsWindow(ctx->hwnd))
+            continue;
+
+        return ctx; // the first working context
+    }
+
+    return NULL;
+}
+
+static void WINAPI on_eventA(EventInfo *ev)
+{
+    static UINT serial = 0;
+    log_strf("on_eventA: EventType:%d, pressure:%d, xTilt: %d, yTilt: %d, buttonsState:%d, serial:%d\n", ev->type, ev->pressure, ev->xTilt, ev->yTilt, ev->buttonsState, serial);
+    EnterCriticalSection(&g_lock);
+
+    ContextA *ctx = get_active_ctx();
+
+    if (!ctx) {
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+
+    BOOL is_proximity =
+        ev->type == kEventTypeProximityIn ||
+        ev->type == kEventTypeProximityOut;
+
+    if (g_deviceInfo.id != -1 && !ctx->inProximity && !is_proximity) {
+        ev->type = kEventTypeProximityIn;
+        is_proximity = TRUE;
+    }
+
+    if (!ctx->enabled && (!is_proximity || g_deviceInfo.id == -1)) {
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+
+    PacketData *pkt = queue_write(&ctx->queue);
+
+    if (!pkt) {
+        log_strf("on_eventA: Queue Full\n");
+
+        pkt = queue_peek_prev(&ctx->queue);
+        if (pkt)
+            pkt->pkStatus |= TPS_QUEUE_ERR;
+
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+
+    if (!serial)
+        serial++;
+
+    memset(pkt, 0, sizeof(PacketData));
+
+    // PROXIMITY
+
+    if (ev->type == kEventTypeProximityIn) {
+        ctx->inProximity = TRUE;
+        pkt->pkStatus |= TPS_PROXIMITY;
+    }
+    else if (ev->type == kEventTypeProximityOut) {
+        ctx->inProximity = FALSE;
+    }
+    else if (ctx->inProximity) {
+        pkt->pkStatus |= TPS_PROXIMITY;
+    }
+
+    pkt->pkTime = ev->time;
+    pkt->pkSerialNumber = serial++;
+    pkt->pkButtons = ev->buttonsState;
+
+    const LOGCONTEXTA *lc = &ctx->logContext;
+
+    pkt->pkX = scale_axis(ev->x,
+                          lc->lcInOrgX, lc->lcInExtX,
+                          lc->lcOutOrgX, lc->lcOutExtX);
+
+    LONG fy = lc->lcInExtY - ev->y;
+
+    pkt->pkY = scale_axis(fy,
+                          lc->lcInOrgY, lc->lcInExtY,
+                          lc->lcOutOrgY, lc->lcOutExtY);
+
+    pkt->pkNormalPressure = ev->pressure;
+
+    pkt->pkOrientation.orAltitude =
+        900 - 15 * max(abs(ev->xTilt), abs(ev->yTilt));
+
+    pkt->pkOrientation.orAzimuth =
+        calculate_azimuth(ev->xTilt, ev->yTilt);
+
+    pkt->pkChanged = lc->lcPktData;
+
+    log_strf("on_eventA: x %d y %d p %d tltx %d tlty %d serial %d\n",
+             ev->x, ev->y, ev->pressure,
+             ev->xTilt, ev->yTilt,
+             pkt->pkSerialNumber);
+
+    // send the message
+
+    if (is_proximity) {
+        BOOL isIn = ev->type == kEventTypeProximityIn;
+
+        context_messageA(ctx,
+                         XWT_PROXIMITY,
+                         (WPARAM)ctx->handle,
+                         MAKELPARAM(isIn, 1));
+    }
+    else if (lc->lcOptions & CXO_MESSAGES) {
+
+        context_messageA(ctx,
+                         XWT_PACKET,
+                         pkt->pkSerialNumber,
+                         (LPARAM)ctx->handle);
+    }
+
+    LeaveCriticalSection(&g_lock);
+}
+
+static void init_log_contextA(LPLOGCONTEXTA lctx) {
+    memset(lctx, 0, sizeof(LOGCONTEXTA));
+
+    /* Copy tablet name as ANSI */
+    for (size_t i = 0; i < sizeof(kXWinTabID); i++)
+        lctx->lcName[i] = (char)kXWinTabID[i];
+
+    lctx->lcOptions = CXO_SYSTEM;
+    lctx->lcStatus = CXS_ONTOP;
+    lctx->lcLocks = CXL_INSIZE | CXL_INASPECT | CXL_MARGIN |
+                    CXL_SENSITIVITY | CXL_SYSOUT;
+
+    lctx->lcMsgBase = WT_DEFBASE;
+    //lctx->lcDevice  = 0;
+    lctx->lcDevice = g_deviceInfo.id != -1 ? g_deviceInfo.id : 0;
+    lctx->lcPktRate = 100;
+
+    lctx->lcPktData = PK_CONTEXT | PK_STATUS | PK_SERIAL_NUMBER | PK_TIME |
+                      PK_CURSOR | PK_BUTTONS | PK_X | PK_Y |
+                      PK_NORMAL_PRESSURE | PK_ORIENTATION;
+
+    lctx->lcPktMode  = 0;
+    lctx->lcMoveMask = PK_BUTTONS | PK_X | PK_Y |
+                       PK_NORMAL_PRESSURE | PK_ORIENTATION;
+
+    lctx->lcBtnDnMask = 0xffffffff;
+    lctx->lcBtnUpMask = 0xffffffff;
+
+    lctx->lcInOrgZ  = 0;
+    lctx->lcInExtZ  = 0;
+    lctx->lcOutOrgZ = 0;
+    lctx->lcOutExtZ = 0;
+
+    if (g_deviceInfo.id == -1) {
+        /* Fallback values if no tablet detected */
+        lctx->lcInOrgX = 0;
+        lctx->lcInOrgY = 0;
+        lctx->lcInExtX = 1024;
+        lctx->lcInExtY = 1024;
+    } else {
+        lctx->lcInOrgX = g_deviceInfo.xAxis.min;
+        lctx->lcInOrgY = g_deviceInfo.yAxis.min;
+        lctx->lcInExtX = g_deviceInfo.xAxis.max - g_deviceInfo.xAxis.min;
+        lctx->lcInExtY = g_deviceInfo.yAxis.max - g_deviceInfo.yAxis.min;
+    }
+
+    lctx->lcSensX = 65536;
+    lctx->lcSensY = 65536;
+    lctx->lcSensZ = 65536;
+
+    lctx->lcSysMode = 0;
+
+    lctx->lcSysOrgX = lctx->lcOutOrgX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    lctx->lcSysOrgY = lctx->lcOutOrgY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    lctx->lcSysExtX = lctx->lcOutExtX = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    lctx->lcSysExtY = lctx->lcOutExtY = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    lctx->lcSysSensX = 65536;
+    lctx->lcSysSensY = 65536;
+}
+
+/* WTInfoA implementation */
+UINT WINAPI WTInfoA(UINT cat, UINT idx, LPVOID ptr)
+{
+    if (!g_didInit)
+        load_xwintab();
+
+    if ((cat == WTI_DEFCONTEXT || cat == WTI_DEFSYSCTX) && !idx) {
+        log_strf("WTInfoA: Request for default logcontext. cat:%d, idx:%d\n", cat, idx);
+        if (ptr)
+            init_log_contextA((LPLOGCONTEXTA)ptr);
+        return sizeof(LOGCONTEXTA);
+    }
+
+    if (cat == WTI_INTERFACE && idx == IFC_WINTABID) {
+        if (ptr) {
+            char *out = (char *)ptr;
+            for (size_t i = 0; i < sizeof(kXWinTabID); i++)
+                out[i] = (char)kXWinTabID[i];
+        }
+        return sizeof(kXWinTabID);
+    }
+
+    UINT res = TabletInfoCommon(cat, idx, ptr);
+    if (res)
+        return res;
+
+    log_strf("WTInfoA: unhandled cat %d idx %d\n", cat, idx);
+    return 0;
+}
+
+/* WTOpenA using ContextA */
+HCTX WINAPI WTOpenA(HWND hwnd, LPLOGCONTEXTA pLContext, BOOL enable) {
+    log_hwnd_info("WTOpenA", hwnd);
+
+    if (!IsWindow(hwnd)) {
+        log_strf("WTOpenA: hwnd invalid: %p\n", hwnd);
+        return NULL;
+    }
+
+    if (!g_didInit)
+        load_xwintab();
+
+    if (!pLContext) {
+        log_strf("WTOpenA: !pLContext return NULL\n");
+        return NULL;
+    }
+
+    if (!pLContext->lcInExtX || !pLContext->lcInExtY) {
+        log_strf("WTOpenA: invalid lcInExtX/lcInExtY\n");
+        return NULL;
+    }
+
+    ContextA *ctx = NULL;
+    for (int i = 0; i < MAX_CONTEXTS; ++i) {
+        if (g_contexts[i].handle == 0) {
+            ctx = &g_contexts[i];
+            break;
+        }
+    }
+
+    if (!ctx) {
+        log_strf("WTOpenA: no free context slot\n");
+        return NULL;
+    }
+
+    ctx->handle = alloc_context_handle();
+    ctx->hwnd = hwnd;
+
+    log_strf("WTOpenA: new context handle=%p slot=%p\n", ctx->handle, ctx);
+
+    memcpy(&ctx->logContext, pLContext, sizeof(LOGCONTEXTA));
+    if (ctx->logContext.lcMsgBase == 0)
+        ctx->logContext.lcMsgBase = WT_DEFBASE;
+
+    if (g_deviceInfo.id != -1) {
+        ctx->enabled = enable;
+        ctx->logContext.lcStatus = enable ? CXS_ONTOP : CXS_DISABLED;
+
+        if (!queue_init(&ctx->queue)) {
+            log_strf("WTOpenA: queue_init failed\n");
+            ctx->handle = 0;
+            return NULL;
+        }
+
+        EnterCriticalSection(&g_lock);
+
+        if (!pBeginEvents(on_eventA)) {
+            log_strf("WTOpenA: Failed to select events\n");
+            ctx->enabled = FALSE;
+            LeaveCriticalSection(&g_lock);
+            ctx->handle = 0;
+            return NULL;
+        }
+
+        g_thread = CreateThread(NULL, 0, thread_func, NULL, 0, NULL);
+        if (!g_thread) {
+            log_strf("WTOpenA: Failed to start event thread\n");
+            ctx->enabled = FALSE;
+            LeaveCriticalSection(&g_lock);
+            ctx->handle = 0;
+            return NULL;
+        }
+
+        log_strf("WTOpenA: Started Event Thread\n");
+        LeaveCriticalSection(&g_lock);
+    }
+
+    log_strf("WTOpenA: XWT_CTXOPEN\n");
+    context_messageA(ctx, XWT_CTXOPEN,
+                     (WPARAM)ctx->handle,
+                     ctx->logContext.lcStatus);
+
+    log_strf("WTOpenA: XWT_CTXOVERLAP\n");
+    context_messageA(ctx, XWT_CTXOVERLAP,
+                     (WPARAM)ctx->handle,
+                     ctx->logContext.lcStatus);
+
+    g_contextCount++;
+
+    return ctx->handle;
+}
+
+/* --------------------------------------------------------------------
+ * Compatibility stub for Expresii (tested with 2026-02-16 build).
+ *
+ * That version calls WTGetA/WTSetA during startup and aborts if the
+ * entry points are missing, even though their functionality is not
+ * required afterwards.
+ *
+ * Newer versions no longer depend on these functions.
+ *
+ * This is therefore a minimal no-op implementation whose sole purpose
+ * is to keep that specific version from crashing.
+ * -------------------------------------------------------------------- */
+BOOL WINAPI WTGetA(HCTX hCtx, LPLOGCONTEXTA lpLogCtx)
+{
+    log_strf("WTGetA");
+    return FALSE;
+}
+
+BOOL WINAPI WTSetA(HCTX ctx, LPLOGCONTEXTA pLContext)
+{
+    log_strf("WTSetA");
+    return FALSE;
+}
+
+/* --------------------------------------------------------------------
+ * Find a context by its HCTX handle.
+ *
+ * Performs a linear search in the active portion of the global context
+ * array (0 .. g_contextCount - 1).
+ *
+ * Returns a pointer to the matching context, or NULL if the handle
+ * is not found.
+ * -------------------------------------------------------------------- */
+static ContextA* find_ctx(HCTX h)
+{
+    for (int i = 0; i < g_contextCount; ++i)
+        if (g_contexts[i].handle == h)
+            return &g_contexts[i];
+
+    return NULL;
+}
+
+BOOL WINAPI WTEnable(HCTX ctx, BOOL enable) {
+    log_strf("WTEnable: ctx=%p enable=%d\n", ctx, enable);
+    if (!ctx)
+        return FALSE;
+
+     if (ctx == g_context.handle) {
+         EnterCriticalSection(&g_lock);
+         g_context.enabled = enable;
+         g_context.logContext.lcStatus = enable ? CXS_ONTOP : CXS_DISABLED;
+         LeaveCriticalSection(&g_lock);
+
+         log_strf("WTEnable - g_context.enabled:%d\n", enable);
+         context_message(&g_context, XWT_CTXOVERLAP, (WPARAM) g_context.handle,
+                        g_context.logContext.lcStatus);
+     } else {
+        ContextA* contextA = find_ctx(ctx);
+        if (!contextA)
+            return FALSE;
+
+        EnterCriticalSection(&g_lock);
+        contextA->enabled = enable;
+        contextA->logContext.lcStatus = enable ? CXS_ONTOP : CXS_DISABLED;
+        LeaveCriticalSection(&g_lock);
+
+        log_strf("WTEnable - context enabled:%d\n", enable);
+        context_messageA(contextA, XWT_CTXOVERLAP, (WPARAM) contextA->handle,
+                         contextA->logContext.lcStatus);
+     }
+
+     return TRUE;
+}
+
+BOOL WINAPI WTPacket(HCTX ctx, UINT serial, LPVOID ptr)
+{
+    log_strf("WTPacket called: ctx=%p serial=%u\n", ctx, serial);
+    if (!ctx)
+        return FALSE;
+
+    ContextA* contextA = find_ctx(ctx);
+    if (!contextA)
+        return FALSE;
+
+    byte count = 1;
+    EnterCriticalSection(&g_lock);
+
+    int read = 0;
+    char *out = (char *) ptr;
+
+    while (read != count) {
+        PacketData *pkt = queue_read(&contextA->queue);
+        if (!pkt)
+            break;
+
+        log_strf("WTPacket read a packet #%d\n", read + 1);
+
+        if (out)
+            out += packet_copy(contextA->logContext.lcPktData,
+                                contextA->handle,
+                                pkt,
+                                out);//packet_copyA(contextA, pkt, out);
+        read++;
+    }
+
+    log_strf("WTPacket: Read %d Packets\n", read);
+    LeaveCriticalSection(&g_lock);
+
+    return read > 0;
+}
+
+
+
