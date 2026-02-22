@@ -888,6 +888,28 @@ int WINAPI WTPacketsPeek(HCTX ctx, int count, LPVOID ptr) {
     return data.read;
 }
 
+BOOL WINAPI WTQueuePacketsEx(HCTX ctx, UINT *pBegin, UINT *pEnd) {
+    if (!ctx || g_context.handle != ctx || !pBegin || !pEnd)
+        return FALSE;
+
+    EnterCriticalSection(&g_lock);
+
+    if (g_context.queue.count == 0) {
+        *pBegin = *pEnd = 0;
+    } else {
+        PacketData *first = &g_context.queue.buffer[g_context.queue.nextRead];
+        int lastIdx = (g_context.queue.nextWrite + g_context.queue.size - 1)
+                      % g_context.queue.size;
+        PacketData *last = &g_context.queue.buffer[lastIdx];
+
+        *pBegin = first->pkSerialNumber;
+        *pEnd   = last->pkSerialNumber;
+    }
+
+    LeaveCriticalSection(&g_lock);
+    return TRUE;
+}
+
 BOOL WINAPI WTGetW(HCTX ctx, LPLOGCONTEXTW pLContext) {
     if (!ctx || g_context.handle != ctx || !pLContext)
         return FALSE;
@@ -1365,41 +1387,100 @@ BOOL WINAPI WTEnable(HCTX ctx, BOOL enable) {
      return TRUE;
 }
 
+// Helper to find a packet by serial in the queue (must be called under g_lock)
+static PacketData* find_packet_by_serial(PacketQueue *queue, UINT serial) {
+    if (!queue->count)
+        return NULL;
+
+    int pos = queue->nextRead;
+    for (int i = 0; i < queue->count; i++) {
+        PacketData *pkt = &queue->buffer[pos];
+        if (pkt->pkSerialNumber == serial)
+            return pkt;
+        pos = (pos + 1) % queue->size;
+    }
+    return NULL;
+}
+
+static BOOL Packet(
+    PacketQueue *queue,
+    WTPKT lcPktData,
+    HCTX handle,
+    UINT serial,
+    LPVOID out
+) {
+    BOOL found = FALSE;
+    int packets_to_consume = 0;
+
+    if (queue->count > 0) {
+        int search_pos = queue->nextRead;
+
+        for (int i = 0; i < queue->count; i++) {
+            packets_to_consume++;
+
+            PacketData *pkt = &queue->buffer[search_pos];
+
+            if (pkt->pkSerialNumber == serial) {
+                found = TRUE;
+
+                if (out) {
+                    packet_copy(lcPktData, handle, pkt, out);
+                }
+                break;
+            }
+
+            search_pos = (search_pos + 1) % queue->size;
+        }
+    }
+
+    if (found) {
+        for (int i = 0; i < packets_to_consume; i++) {
+            queue_read(queue);
+        }
+    }
+
+    return found;
+}
+
+
 BOOL WINAPI WTPacket(HCTX ctx, UINT serial, LPVOID ptr)
 {
     log_strf("WTPacket called: ctx=%p serial=%u\n", ctx, serial);
+
     if (!ctx)
         return FALSE;
 
-    ContextA* contextA = find_ctx(ctx);
-    if (!contextA)
-        return FALSE;
-
-    byte count = 1;
     EnterCriticalSection(&g_lock);
 
-    int read = 0;
-    char *out = (char *) ptr;
+    BOOL result = FALSE;
 
-    while (read != count) {
-        PacketData *pkt = queue_read(&contextA->queue);
-        if (!pkt)
-            break;
+    if (ctx == g_context.handle) {
 
-        log_strf("WTPacket read a packet #%d\n", read + 1);
+        result = Packet(
+            &g_context.queue,
+            g_context.logContext.lcPktData,
+            g_context.handle,
+            serial,
+            ptr
+        );
 
-        if (out)
-            out += packet_copy(contextA->logContext.lcPktData,
-                                contextA->handle,
-                                pkt,
-                                out);//packet_copyA(contextA, pkt, out);
-        read++;
+    } else {
+
+        ContextA* contextA = find_ctx(ctx);
+
+        if (contextA) {
+            result = Packet(
+                &contextA->queue,
+                contextA->logContext.lcPktData,
+                contextA->handle,
+                serial,
+                ptr
+            );
+        }
     }
 
-    log_strf("WTPacket: Read %d Packets\n", read);
     LeaveCriticalSection(&g_lock);
-
-    return read > 0;
+    return result;
 }
 
 
