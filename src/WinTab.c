@@ -230,12 +230,12 @@ static BOOL queue_resize(PacketQueue *queue, int size) {
     if (n > new_count)
         n = new_count;
 
-    memcpy(resized, &queue->buffer[queue->nextRead], n);
+    memcpy(resized, &queue->buffer[queue->nextRead], sizeof(PacketData) * n);
     copied = n;
 
     if (copied != new_count) {
         n = new_count - copied;
-        memcpy(&resized[copied], queue->buffer, n);
+        memcpy(&resized[copied], queue->buffer, sizeof(PacketData) * n);
     }
 
     free(queue->buffer);
