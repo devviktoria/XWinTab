@@ -96,7 +96,7 @@ static UINT_PTR g_nextContextHandle = 0x80;
 
 #define XWINTAB_VERSION_STRINGIFY(S) #S
 #define XWINTAB_VERSION_MAJOR 0
-#define XWINTAB_VERSION_MINOR 2
+#define XWINTAB_VERSION_MINOR 4
 #define XWINTAB_NAME(MA,MI) "XWinTab " XWINTAB_VERSION_STRINGIFY(MA) "." \
                                        XWINTAB_VERSION_STRINGIFY(MI)
 
@@ -270,12 +270,12 @@ static BOOL queue_resize(PacketQueue *queue, int size) {
     if (n > new_count)
         n = new_count;
 
-    memcpy(resized, &queue->buffer[queue->nextRead], n);
+    memcpy(resized, &queue->buffer[queue->nextRead], sizeof(PacketData) * n);
     copied = n;
 
     if (copied != new_count) {
         n = new_count - copied;
-        memcpy(&resized[copied], queue->buffer, n);
+        memcpy(&resized[copied], queue->buffer, sizeof(PacketData) * n);
     }
 
     free(queue->buffer);

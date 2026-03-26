@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <windef.h>
 
@@ -37,6 +38,8 @@ typedef struct HelperDataTAG {
 static HelperData g_data;
 
 static EventInfo g_eventInfo;
+
+static const char *g_requiredName;
 
 
 // ----------------
@@ -278,8 +281,16 @@ static int check_device(const xcb_input_device_info_t *device,
         device->device_use != XCB_INPUT_DEVICE_USE_IS_X_EXTENSION_POINTER)
         return 0;
 
-    if (!match_token(name, "stylus") && !match_token(name, "pen") && !match_token(name, "artist tablet"))
-        return 0;
+    if (!g_requiredName) {
+        if (!match_token(name, "stylus") && !match_token(name, "pen"))
+            return 0;
+    } else {
+        const char *name_p = xcb_str_name(name);
+        int name_len = xcb_str_name_length(name);
+        if (name_len != strlen(g_requiredName) ||
+            strncmp(name_p, g_requiredName, name_len))
+            return 0;
+    }
 
     int class_count = device->num_class_info;
     xcb_input_input_info_iterator_t input_itr = *inputItr;
@@ -378,6 +389,8 @@ static int setup() {
         g_data.connection = NULL;
         return 0;
     }
+
+    g_requiredName = getenv("XWINTAB_DEVICE");
 
     g_data.device.id = -1;
     check_devices(dev_list_reply);
